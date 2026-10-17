@@ -20,6 +20,7 @@ members = [
   "schelling_oracle",
   "shared",
   "tournament",
+  "yield_aggregator",
 ]
 
 [workspace.dependencies]

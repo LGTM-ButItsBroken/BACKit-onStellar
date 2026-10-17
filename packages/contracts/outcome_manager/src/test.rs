@@ -726,6 +726,110 @@ fn test_submit_duplicate_submission_fails() {
     assert_contract_error(result, OutcomeError::DuplicateSubmission);
 }
 
+/// Sign the deployment-bound digest for `submit_bound_outcome`.
+fn sign_bound_digest(env: &Env, secret: &BytesN<32>, digest: &BytesN<32>) -> BytesN<64> {
+    use ed25519_dalek::{Signer, SigningKey};
+    let signing_key = SigningKey::from_bytes(&secret.to_array());
+    BytesN::from_array(env, &signing_key.sign(&digest.to_array()).to_bytes())
+}
+
+#[test]
+fn test_bound_outcome_with_authentic_signature_is_accepted() {
+    let env = Env::default();
+    let (_admin, registry_id, secret, pubkey, client) = setup_single_oracle(&env);
+
+    let digest = client.bound_message_digest(&5, &1, &100, &1000);
+    let signed = SignedOutcome {
+        call_id: 5,
+        outcome: 1,
+        price: 100,
+        timestamp: 1000,
+        oracle_pubkey: pubkey,
+        signature: sign_bound_digest(&env, &secret, &digest),
+    };
+
+    client.submit_bound_outcome(&registry_id, &signed, &0u64);
+    assert_eq!(client.get_outcome(&5).outcome, 1);
+}
+
+#[test]
+fn test_bound_outcome_rejects_tampered_fields() {
+    let env = Env::default();
+    let (_admin, registry_id, secret, pubkey, client) = setup_single_oracle(&env);
+
+    // Signed for price 100, submitted with price 101.
+    let digest = client.bound_message_digest(&5, &1, &100, &1000);
+    let signed = SignedOutcome {
+        call_id: 5,
+        outcome: 1,
+        price: 101,
+        timestamp: 1000,
+        oracle_pubkey: pubkey,
+        signature: sign_bound_digest(&env, &secret, &digest),
+    };
+
+    assert!(client
+        .try_submit_bound_outcome(&registry_id, &signed, &0u64)
+        .is_err());
+}
+
+#[test]
+fn test_bound_outcome_rejects_a_signature_over_the_unbound_message() {
+    let env = Env::default();
+    let (_admin, registry_id, secret, pubkey, client) = setup_single_oracle(&env);
+
+    // A signature valid for submit_outcome does not authorise the bound entry point.
+    let signed = SignedOutcome {
+        call_id: 5,
+        outcome: 1,
+        price: 100,
+        timestamp: 1000,
+        oracle_pubkey: pubkey,
+        signature: sign_outcome(&env, &secret, 5, 1, 100, 1000),
+    };
+
+    assert!(client
+        .try_submit_bound_outcome(&registry_id, &signed, &0u64)
+        .is_err());
+}
+
+#[test]
+fn test_bound_digest_differs_per_contract_deployment() {
+    let env = Env::default();
+    let (_a1, _r1, _s1, _p1, first) = setup_single_oracle(&env);
+    let second_id = env.register_contract(None, OutcomeManager);
+    let second = OutcomeManagerClient::new(&env, &second_id);
+
+    // Same fields, different contract address -> different digest, so a
+    // signature for one deployment cannot be replayed on another.
+    assert_ne!(
+        first.bound_message_digest(&5, &1, &100, &1000),
+        second.bound_message_digest(&5, &1, &100, &1000)
+    );
+}
+
+#[test]
+fn test_bound_outcome_rejects_unauthorized_signer() {
+    let env = Env::default();
+    let (_admin, registry_id, _secret, _pubkey, client) = setup_single_oracle(&env);
+    let (stranger_secret, stranger_pubkey) = gen_keypair(&env);
+
+    let digest = client.bound_message_digest(&5, &1, &100, &1000);
+    let signed = SignedOutcome {
+        call_id: 5,
+        outcome: 1,
+        price: 100,
+        timestamp: 1000,
+        oracle_pubkey: stranger_pubkey,
+        signature: sign_bound_digest(&env, &stranger_secret, &digest),
+    };
+
+    assert_contract_error(
+        client.try_submit_bound_outcome(&registry_id, &signed, &0u64),
+        OutcomeError::UnauthorizedOracle,
+    );
+}
+
 #[test]
 fn test_submit_invalid_outcome_fails() {
     let env = Env::default();

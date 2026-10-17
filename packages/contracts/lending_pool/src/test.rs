@@ -610,3 +610,209 @@ fn max_allocation_bps_per_market_is_configurable() {
         AllocationOutcome::Allocated(1_000_000, OUTCOME_UP)
     );
 }
+
+// ─── Collateralised borrowing (SC-009) ───────────────────────────────────────
+
+use crate::errors::LendingPoolError;
+use crate::loans::LoanStatus;
+
+const LIQUIDITY: i128 = 50_000_000;
+
+/// Fund the pool, set an oracle and mark `borrower`'s position for call 1.
+fn setup_loan_market<'a>(
+    value: i128,
+    win_prob_bps: u32,
+) -> (TestSetup<'a>, Address, Address) {
+    let setup = setup_full_stack();
+    setup.pool.deposit(&setup.user, &LIQUIDITY);
+    let oracle = Address::generate(&setup.env);
+    setup.pool.set_price_oracle(&oracle);
+    let borrower = setup.counterparty.clone();
+    setup
+        .pool
+        .set_collateral_mark(&oracle, &borrower, &1u64, &value, &win_prob_bps, &false);
+    (setup, oracle, borrower)
+}
+
+fn advance_ledgers(setup: &TestSetup, n: u32) {
+    setup.env.ledger().with_mut(|l| l.sequence_number += n);
+}
+
+#[test]
+fn borrow_up_to_half_of_collateral_value_succeeds() {
+    let (setup, _oracle, borrower) = setup_loan_market(20_000_000, 9_000);
+    let token = TokenClient::new(&setup.env, &setup.token);
+    let before = token.balance(&borrower);
+
+    setup.pool.borrow(&borrower, &1u64, &10_000_000);
+
+    assert_eq!(token.balance(&borrower), before + 10_000_000);
+    assert_eq!(setup.pool.total_borrowed(), 10_000_000);
+    let loan = setup.pool.get_loan(&borrower, &1u64).unwrap();
+    assert_eq!(loan.principal, 10_000_000);
+    assert_eq!(loan.status, LoanStatus::Active);
+    // Lending moves assets, it does not create or destroy them.
+    assert_eq!(setup.pool.get_pool_stats().total_value_locked, LIQUIDITY);
+}
+
+#[test]
+fn borrow_above_fifty_percent_ltv_is_rejected() {
+    let (setup, _oracle, borrower) = setup_loan_market(20_000_000, 9_000);
+    assert_eq!(
+        setup.pool.try_borrow(&borrower, &1u64, &10_000_001),
+        Err(Ok(LendingPoolError::ExceedsLtv))
+    );
+    assert_eq!(setup.pool.total_borrowed(), 0);
+}
+
+#[test]
+fn borrow_requires_a_dominant_position() {
+    let (setup, _oracle, borrower) = setup_loan_market(20_000_000, 7_999);
+    assert_eq!(
+        setup.pool.try_borrow(&borrower, &1u64, &1_000_000),
+        Err(Ok(LendingPoolError::CollateralNotEligible))
+    );
+}
+
+#[test]
+fn borrow_without_a_mark_is_rejected() {
+    let setup = setup_full_stack();
+    setup.pool.deposit(&setup.user, &LIQUIDITY);
+    assert_eq!(
+        setup.pool.try_borrow(&setup.counterparty, &1u64, &1_000_000),
+        Err(Ok(LendingPoolError::NoCollateralMark))
+    );
+}
+
+#[test]
+fn cannot_borrow_twice_against_the_same_position() {
+    let (setup, _oracle, borrower) = setup_loan_market(20_000_000, 9_000);
+    setup.pool.borrow(&borrower, &1u64, &1_000_000);
+    assert_eq!(
+        setup.pool.try_borrow(&borrower, &1u64, &1_000_000),
+        Err(Ok(LendingPoolError::LoanExists))
+    );
+}
+
+#[test]
+fn only_the_oracle_can_publish_marks() {
+    let (setup, _oracle, borrower) = setup_loan_market(20_000_000, 9_000);
+    let impostor = Address::generate(&setup.env);
+    assert_eq!(
+        setup
+            .pool
+            .try_set_collateral_mark(&impostor, &borrower, &1u64, &99_000_000, &9_900, &false),
+        Err(Ok(LendingPoolError::Unauthorized))
+    );
+}
+
+#[test]
+fn interest_accrues_per_ledger() {
+    let (setup, _oracle, borrower) = setup_loan_market(20_000_000, 9_000);
+    setup.pool.borrow(&borrower, &1u64, &10_000_000);
+    assert_eq!(setup.pool.loan_debt(&borrower, &1u64), 10_000_000);
+
+    advance_ledgers(&setup, 1_000);
+
+    // 10_000_000 * 16 ppb * 1_000 ledgers = 160
+    assert_eq!(setup.pool.loan_debt(&borrower, &1u64), 10_000_160);
+}
+
+#[test]
+fn repaying_returns_principal_and_interest_to_the_pool() {
+    let (setup, _oracle, borrower) = setup_loan_market(20_000_000, 9_000);
+    let token = TokenClient::new(&setup.env, &setup.token);
+    setup.pool.borrow(&borrower, &1u64, &10_000_000);
+    advance_ledgers(&setup, 1_000);
+
+    let paid = setup.pool.repay(&borrower, &1u64);
+
+    assert_eq!(paid, 10_000_160);
+    assert_eq!(setup.pool.total_borrowed(), 0);
+    assert_eq!(token.balance(&setup.pool.address), LIQUIDITY + 160);
+    assert_eq!(
+        setup.pool.get_loan(&borrower, &1u64).unwrap().status,
+        LoanStatus::Repaid
+    );
+    assert_eq!(
+        setup.pool.try_repay(&borrower, &1u64),
+        Err(Ok(LendingPoolError::LoanClosed))
+    );
+}
+
+#[test]
+fn healthy_loans_cannot_be_liquidated() {
+    let (setup, _oracle, borrower) = setup_loan_market(20_000_000, 9_000);
+    setup.pool.borrow(&borrower, &1u64, &10_000_000);
+    // Health factor 2.0 (20_000 bps).
+    assert_eq!(setup.pool.loan_health_bps(&borrower, &1u64), 20_000);
+    assert_eq!(
+        setup.pool.try_liquidate(&setup.user, &borrower, &1u64),
+        Err(Ok(LendingPoolError::NotLiquidatable))
+    );
+}
+
+#[test]
+fn a_loan_below_health_factor_1_05_is_liquidated() {
+    let (setup, oracle, borrower) = setup_loan_market(20_000_000, 9_000);
+    let token = TokenClient::new(&setup.env, &setup.token);
+    setup.pool.borrow(&borrower, &1u64, &10_000_000);
+
+    // The position's value falls to 10_400_000: health 1.04 < 1.05.
+    setup
+        .pool
+        .set_collateral_mark(&oracle, &borrower, &1u64, &10_400_000, &8_000, &false);
+    let liquidator_before = token.balance(&setup.user);
+
+    let paid = setup.pool.liquidate(&setup.user, &borrower, &1u64);
+
+    assert_eq!(paid, 10_000_000);
+    assert_eq!(token.balance(&setup.user), liquidator_before - 10_000_000);
+    assert_eq!(setup.pool.total_borrowed(), 0);
+    assert_eq!(
+        setup.pool.get_loan(&borrower, &1u64).unwrap().status,
+        LoanStatus::Liquidated
+    );
+}
+
+#[test]
+fn a_loan_at_exactly_health_factor_1_05_is_not_liquidated() {
+    let (setup, oracle, borrower) = setup_loan_market(20_000_000, 9_000);
+    setup.pool.borrow(&borrower, &1u64, &10_000_000);
+    setup
+        .pool
+        .set_collateral_mark(&oracle, &borrower, &1u64, &10_500_000, &8_000, &false);
+    assert_eq!(
+        setup.pool.try_liquidate(&setup.user, &borrower, &1u64),
+        Err(Ok(LendingPoolError::NotLiquidatable))
+    );
+}
+
+#[test]
+fn settlement_makes_an_outstanding_loan_liquidatable() {
+    let (setup, oracle, borrower) = setup_loan_market(20_000_000, 9_000);
+    setup.pool.borrow(&borrower, &1u64, &10_000_000);
+
+    // The market settles while the loan is still healthy on paper.
+    setup
+        .pool
+        .set_collateral_mark(&oracle, &borrower, &1u64, &20_000_000, &10_000, &true);
+
+    setup.pool.liquidate(&setup.user, &borrower, &1u64);
+    assert_eq!(
+        setup.pool.get_loan(&borrower, &1u64).unwrap().status,
+        LoanStatus::Liquidated
+    );
+}
+
+#[test]
+fn cannot_borrow_more_than_the_pool_holds() {
+    let (setup, oracle, borrower) = setup_loan_market(20_000_000, 9_000);
+    setup
+        .pool
+        .set_collateral_mark(&oracle, &borrower, &1u64, &400_000_000, &9_000, &false);
+    assert_eq!(
+        setup.pool.try_borrow(&borrower, &1u64, &LIQUIDITY.checked_add(1).unwrap()),
+        Err(Ok(LendingPoolError::InsufficientLiquidity))
+    );
+}

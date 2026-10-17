@@ -1995,6 +1995,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "yield-aggregator"
+version = "0.0.0"
+dependencies = [
+ "backit-shared",
+ "ed25519-dalek",
+ "rand",
+ "soroban-sdk",
+]
+
+[[package]]
 name = "zerocopy"
 version = "0.8.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"

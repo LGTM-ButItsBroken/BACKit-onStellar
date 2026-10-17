@@ -40,10 +40,12 @@
 
 mod errors;
 mod events;
+mod loans;
 mod storage;
 mod types;
 mod xcontract;
 
+pub use loans::{CollateralMark, Loan, LoanStatus};
 pub use types::{Allocation, AllocationOutcome, MarketAllocationInput, PoolConfig, PoolStats};
 
 #[cfg(test)]
@@ -140,8 +142,11 @@ fn other_position(position: u32) -> u32 {
 fn compute_tvl(env: &Env, config: &PoolConfig) -> Result<i128, LendingPoolError> {
     let liquid = token_balance(env, &config.stake_token);
     let locked = get_total_allocated_locked(env);
+    // Loans out to borrowers are still pool assets, so lending does not dilute LP shares.
+    let lent = loans::total_borrowed(env);
     liquid
         .checked_add(locked)
+        .and_then(|v| v.checked_add(lent))
         .ok_or(LendingPoolError::Overflow)
 }
 
@@ -247,6 +252,77 @@ impl LendingPool {
             },
         );
         Ok(())
+    }
+
+    // ─── Collateralised borrowing (SC-009) ──────────────────────────────
+
+    /// Set the address allowed to publish collateral marks (admin only).
+    pub fn set_price_oracle(env: Env, oracle: Address) -> Result<(), LendingPoolError> {
+        let config = get_config(&env).ok_or(LendingPoolError::NotInitialized)?;
+        config.admin.require_auth();
+        loans::set_oracle(&env, &oracle);
+        Ok(())
+    }
+
+    /// Publish the valuation of `borrower`'s position in `call_id` (oracle only).
+    pub fn set_collateral_mark(
+        env: Env,
+        oracle: Address,
+        borrower: Address,
+        call_id: u64,
+        value: i128,
+        win_prob_bps: u32,
+        settled: bool,
+    ) -> Result<(), LendingPoolError> {
+        loans::set_mark(
+            &env,
+            &oracle,
+            &borrower,
+            call_id,
+            &CollateralMark {
+                value,
+                win_prob_bps,
+                settled,
+            },
+        )
+    }
+
+    /// Borrow up to 50% of the position's mark value. The position must be marked
+    /// at 80% or higher win probability and its market must not have settled.
+    pub fn borrow(env: Env, borrower: Address, call_id: u64, amount: i128) -> Result<(), LendingPoolError> {
+        loans::borrow(&env, &borrower, call_id, amount)
+    }
+
+    /// Repay the full debt (principal plus per-ledger interest). Returns the amount paid.
+    pub fn repay(env: Env, borrower: Address, call_id: u64) -> Result<i128, LendingPoolError> {
+        loans::repay(&env, &borrower, call_id)
+    }
+
+    /// Liquidate a loan whose health factor is below 1.05 or whose market has
+    /// settled: the caller repays the debt and takes over the position.
+    pub fn liquidate(env: Env, liquidator: Address, borrower: Address, call_id: u64) -> Result<i128, LendingPoolError> {
+        loans::liquidate(&env, &liquidator, &borrower, call_id)
+    }
+
+    pub fn get_loan(env: Env, borrower: Address, call_id: u64) -> Option<Loan> {
+        loans::get_loan(&env, &borrower, call_id)
+    }
+
+    /// Debt (principal plus accrued interest) at the current ledger.
+    pub fn loan_debt(env: Env, borrower: Address, call_id: u64) -> Result<i128, LendingPoolError> {
+        let loan = loans::get_loan(&env, &borrower, call_id).ok_or(LendingPoolError::LoanNotFound)?;
+        loans::debt_of(&env, &loan)
+    }
+
+    /// Health factor in basis points (10_000 = 1.0).
+    pub fn loan_health_bps(env: Env, borrower: Address, call_id: u64) -> Result<i128, LendingPoolError> {
+        let loan = loans::get_loan(&env, &borrower, call_id).ok_or(LendingPoolError::LoanNotFound)?;
+        let mark = loans::get_mark(&env, &borrower, call_id).ok_or(LendingPoolError::NoCollateralMark)?;
+        loans::health_bps(&mark, loans::debt_of(&env, &loan)?)
+    }
+
+    pub fn total_borrowed(env: Env) -> i128 {
+        loans::total_borrowed(&env)
     }
 
     // ─── Depositor-facing ────────────────────────────────────────────────
@@ -665,7 +741,7 @@ impl LendingPool {
         let config = get_config(&env).ok_or(LendingPoolError::NotInitialized)?;
         let liquid = token_balance(&env, &config.stake_token);
         let locked = get_total_allocated_locked(&env);
-        let tvl = liquid.checked_add(locked).ok_or(LendingPoolError::Overflow)?;
+        let tvl = compute_tvl(&env, &config)?;
 
         Ok(PoolStats {
             total_deposited: get_total_deposited(&env),

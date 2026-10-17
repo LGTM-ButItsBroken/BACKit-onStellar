@@ -1759,6 +1759,77 @@ mod call_registry {
         client.claim_void_refund(&non_staker, &call.id);
     }
 
+    // ── SC-011: 2..=32 outcome pools ───────────────────────────────────────────
+
+    #[test]
+    fn test_fuzz_1000_creations_with_random_outcome_counts() {
+        let (env, client, _admin, _om) = setup();
+        env.ledger().set_timestamp(1000);
+        let creator = Address::generate(&env);
+        let stake_token = env.register_contract(None, MockToken);
+        client.whitelist_token(&stake_token);
+
+        // Deterministic LCG so a failure is reproducible.
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut created: u64 = 0;
+        for _ in 0..1000 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let outcome_count = 1 + ((state >> 33) % 40) as u32; // 1..=40
+
+            let args = crate::types::CallInitArgs {
+                stake_token: stake_token.clone(),
+                stake_amount: 100_000_000_i128,
+                start_price: TEST_START_PRICE,
+                end_ts: 2000u64,
+                token_address: Address::generate(&env),
+                pair_id: Bytes::from_slice(&env, b"USDC/XLM"),
+                ipfs_cid: Bytes::from_slice(&env, b"cid"),
+                metadata_hash: BytesN::from_array(&env, &[0u8; 32]),
+                condition: ConditionType::TargetAbove(1),
+                outcome_count,
+                gate_kind: None,
+                gate_min_account_age: 0,
+                gate_min_xlm_balance: 0,
+                gate_min_trustlines: 0,
+                gate_badge: None,
+            };
+            let result = client.try_create_call(&creator, &args);
+
+            if (2..=32).contains(&outcome_count) {
+                let call = result.expect("call error").expect("conversion error");
+                created += 1;
+                assert_eq!(call.id, created);
+
+                let pools = client.get_outcome_pools(&call.id);
+                assert_eq!(pools.len(), outcome_count);
+                assert!(pools.iter().all(|p| p == 0));
+                assert_eq!(client.get_vault_balance(&call.id), 0);
+            } else {
+                assert_eq!(result, Err(Ok(CallRegistryError::InvalidOutcomeCount)));
+            }
+        }
+        assert_eq!(client.get_call_count(), created);
+    }
+
+    #[test]
+    fn test_outcome_pools_reflect_stakes_per_outcome() {
+        let (env, client, _admin, _om) = setup();
+        env.ledger().set_timestamp(1000);
+        let creator = Address::generate(&env);
+        let staker = Address::generate(&env);
+        let (call, _) = make_call(&env, &client, &creator);
+
+        client.stake_on_call(&staker, &call.id, &10_000_000_i128, &1);
+        client.stake_on_call(&staker, &call.id, &4_000_000_i128, &2);
+
+        let pools = client.get_outcome_pools(&call.id);
+        assert_eq!(pools.get(0).unwrap(), 10_000_000);
+        assert_eq!(pools.get(1).unwrap(), 4_000_000);
+        assert_eq!(client.get_vault_balance(&call.id), 14_000_000);
+    }
+
     // ── claim_expired_refund ──────────────────────────────────────────────────
 
     // cancel_call

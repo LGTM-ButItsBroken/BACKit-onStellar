@@ -1,26 +1,29 @@
 use soroban_sdk::{contracttype, Address};
 
+/// Share of harvested yield that goes to the protocol treasury (20%).
+pub const DEFAULT_TREASURY_BPS: u32 = 2_000;
+
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct AggregatorConfig {
     pub admin: Address,
-    pub fee_bps: u32,
+    /// Receives the treasury share of harvested yield.
+    pub treasury: Address,
+    /// Receives the remainder, to be credited to winning market payouts.
+    pub payout_pool: Address,
+    /// The asset deposited into vaults (USDC).
+    pub token: Address,
+    pub treasury_bps: u32,
 }
 
+/// Accounting for one vault. Principal is what depositors put in; everything the
+/// vault holds above it is yield and is only ever paid out by `harvest`.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
-pub struct AggregatorStats {
-    pub total_value_locked: i128,
-    pub total_shares: i128,
-    pub share_price: i128,
-    pub total_profits_earned: i128,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct UserPosition {
-    pub user: Address,
-    pub shares: i128,
-    pub deposited_amount: i128,
-    pub pending_payout: i128,
+pub struct VaultState {
+    pub principal: i128,
+    /// `true` after `emergency_unwind`: funds are back in this contract.
+    pub frozen: bool,
+    /// Tokens recovered by `emergency_unwind` that still sit in this contract.
+    pub held: i128,
 }

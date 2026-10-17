@@ -22,4 +22,16 @@ pub enum LendingPoolError {
     Unauthorized = 16,
     InvalidBps = 17,
     InvalidConfig = 18,
+    LoanNotFound = 19,
+    /// The borrower already has an active loan against this position.
+    LoanExists = 20,
+    /// The requested amount exceeds 50% of the collateral mark value.
+    ExceedsLtv = 21,
+    /// The position is not marked above the minimum win probability, or its market has settled.
+    CollateralNotEligible = 22,
+    /// The loan is healthy and its market has not settled.
+    NotLiquidatable = 23,
+    NoCollateralMark = 24,
+    /// The loan was already repaid or liquidated.
+    LoanClosed = 25,
 }

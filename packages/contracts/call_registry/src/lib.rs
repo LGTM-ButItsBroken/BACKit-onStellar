@@ -108,6 +108,9 @@ const MAX_CALL_PAGE_SIZE: u32 = 20;
 const MAX_CALL_STAKERS_PAGE_SIZE: u32 = 50;
 pub const CONTRACT_VERSION: u32 = 1;
 
+/// A call supports between 2 and this many outcome pools.
+pub const MAX_OUTCOME_COUNT: u32 = 32;
+
 /// CallRegistry contract implementation.
 /// Manages prediction calls and staking on market outcomes.
 #[contract]
@@ -228,7 +231,7 @@ impl CallRegistry {
     /// # Errors
     /// * [`CallRegistryError::InvalidStakeAmount`] – `stake_amount` ≤ 0.
     /// * [`CallRegistryError::InvalidEndTime`] – `end_ts` is not in the future.
-    /// * [`CallRegistryError::InvalidOutcomeCount`] – `outcome_count` < 2.
+    /// * [`CallRegistryError::InvalidOutcomeCount`] – `outcome_count` outside 2..=32.
     pub fn create_call(
         env: Env,
         creator: Address,
@@ -265,7 +268,7 @@ impl CallRegistry {
             return Err(CallRegistryError::InvalidStakeAmount);
         }
 
-        if outcome_count < 2 {
+        if !(2..=MAX_OUTCOME_COUNT).contains(&outcome_count) {
             return Err(CallRegistryError::InvalidOutcomeCount);
         }
 
@@ -1380,6 +1383,34 @@ impl CallRegistry {
     pub fn get_outcome_stakes(env: Env, call_id: u64) -> Result<Map<u32, i128>, CallRegistryError> {
         let call = get_call(&env, call_id).ok_or(CallRegistryError::CallNotFound)?;
         Ok(call.outcome_stakes)
+    }
+
+    /// The staked total of every outcome pool as a vector: index `i` holds the
+    /// pool for outcome `i + 1`, so its length is the call's `outcome_count`.
+    /// # Errors
+    /// * [`CallRegistryError::CallNotFound`] – `call_id` does not exist.
+    pub fn get_outcome_pools(env: Env, call_id: u64) -> Result<Vec<i128>, CallRegistryError> {
+        let call = get_call(&env, call_id).ok_or(CallRegistryError::CallNotFound)?;
+        let mut pools = Vec::new(&env);
+        for i in 1..=call.outcome_count {
+            pools.push_back(call.outcome_stakes.get(i).unwrap_or(0));
+        }
+        Ok(pools)
+    }
+
+    /// Total staked across all outcome pools, summed with checked arithmetic.
+    /// # Errors
+    /// * [`CallRegistryError::CallNotFound`] – `call_id` does not exist.
+    /// * [`CallRegistryError::Overflow`] – the sum does not fit in an `i128`.
+    pub fn get_vault_balance(env: Env, call_id: u64) -> Result<i128, CallRegistryError> {
+        let call = get_call(&env, call_id).ok_or(CallRegistryError::CallNotFound)?;
+        let mut total: i128 = 0;
+        for i in 1..=call.outcome_count {
+            total = total
+                .checked_add(call.outcome_stakes.get(i).unwrap_or(0))
+                .ok_or(CallRegistryError::Overflow)?;
+        }
+        Ok(total)
     }
 
     /// Get total number of calls created.

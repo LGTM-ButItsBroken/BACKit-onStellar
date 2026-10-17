@@ -301,6 +301,14 @@ fn try_compute_twap(
 #[contract]
 pub struct OutcomeManager;
 
+/// `sha256(message || contract address || network id)`: the signed message bound to this deployment.
+fn bound_digest(env: &Env, message: &Bytes) -> BytesN<32> {
+    let mut data = message.clone();
+    data.append(&env.current_contract_address().to_xdr(env));
+    data.append(&Bytes::from_slice(env, &env.ledger().network_id().to_array()));
+    env.crypto().sha256(&data).into()
+}
+
 #[contractimpl]
 impl OutcomeManager {
     pub fn initialize(
@@ -541,6 +549,42 @@ impl OutcomeManager {
     }
 
     pub fn submit_outcome(env: Env, registry: Address, signed: SignedOutcome, call_end_ts: u64) {
+        Self::submit_outcome_impl(env, registry, signed, call_end_ts, false);
+    }
+
+    /// Like [`Self::submit_outcome`], but the oracle signs a digest bound to this
+    /// deployment: `sha256(call_id, outcome, price, timestamp, contract address,
+    /// network id)` (see [`Self::bound_message_digest`]). A signature made for
+    /// another contract or network, or over tampered fields, fails verification
+    /// and the transaction reverts.
+    pub fn submit_bound_outcome(
+        env: Env,
+        registry: Address,
+        signed: SignedOutcome,
+        call_end_ts: u64,
+    ) {
+        Self::submit_outcome_impl(env, registry, signed, call_end_ts, true);
+    }
+
+    /// The 32-byte digest an oracle signs for [`Self::submit_bound_outcome`].
+    pub fn bound_message_digest(
+        env: Env,
+        call_id: u64,
+        outcome: u32,
+        price: i128,
+        timestamp: u64,
+    ) -> BytesN<32> {
+        let message = build_message(&env, call_id, outcome, price, timestamp);
+        bound_digest(&env, &message)
+    }
+
+    fn submit_outcome_impl(
+        env: Env,
+        registry: Address,
+        signed: SignedOutcome,
+        call_end_ts: u64,
+        bound: bool,
+    ) {
         if is_paused(&env) {
             soroban_sdk::panic_with_error!(&env, OutcomeError::ContractPaused);
         }
@@ -584,7 +628,12 @@ impl OutcomeManager {
             signed.price,
             signed.timestamp,
         );
-        verify_signature(&env, &signed.oracle_pubkey, &signed.signature, &message);
+        let signed_bytes = if bound {
+            Bytes::from_slice(&env, &bound_digest(&env, &message).to_array())
+        } else {
+            message.clone()
+        };
+        verify_signature(&env, &signed.oracle_pubkey, &signed.signature, &signed_bytes);
 
         // SDEX cross-validation: if SDEX returns a midpoint, check deviation.
         // If SDEX has no liquidity, skip (None = graceful degradation).
